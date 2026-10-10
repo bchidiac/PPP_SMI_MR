@@ -1,0 +1,272 @@
+---
+title: "1c. Clean the psychiatric outcome GWAS"
+output: html_document
+---
+
+<!--
+---- Step 1c | Outcome GWAS cleaning -----------------------------------------
+Cleans the ten outcome GWAS as downloaded and counts their genome-wide
+significant loci (Supplementary Methods SM2; Table 1):
+  - columns renamed to the TwoSampleMR *.outcome convention, and missing
+    fields derived (beta from an odds ratio or a Z-score, effective sample
+    sizes)
+  - filters: 0.05 < EAF < 0.95 for every outcome, and INFO > 0.8 for the five
+    files that report it
+  - panic: positions lifted to GRCh37 with alleles and effects unchanged, SNV
+    alleles complemented where the variant maps to the reverse strand, then
+    one row per rsID
+  - OUD: European frequencies taken from the 1000 Genomes panel, then the
+    frequency filter applied to them
+  - loci: index variants p < 5e-8 clumped at r2 < 0.1 within 1 Mb on the EUR
+    panel, index variants within 1 Mb merged into one locus, the MHC counted
+    once, autosomes only
+
+Reads   raw outcome GWAS, the liftover chain, the LD panel (1b)
+Writes  one cleaned file per outcome, and outcome_loci_counts.csv
+Feeds   2, 7
+-->
+
+```{r setup}
+library(data.table)
+library(dplyr)
+library(rtracklayer)
+
+raw_dir  <- "../MR_data/raw_outcome_GWAS"
+out_dir  <- "../MR_data/target_GWASes_updated"
+chain    <- "../MR_data/liftover_chain_file/hg38ToHg19.over.chain"
+ld_panel <- "../MR_data/LD_reference_panel_1000G_EUR_phase3/EUR"
+plink2   <- "plink2"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+write_clean <- function(d, name) fwrite(d, file.path(out_dir, name), sep = "\t", compress = "gzip")
+```
+
+## Major depressive disorder (PGC 2025, EUR, no 23andMe or UK Biobank)
+
+```{r mdd}
+mdd <- fread(file.path(raw_dir, "pgc-mdd2025_no23andMe-noUKBB_eur_v3-49-24-11.tsv.gz"),
+             select = c("#CHROM", "ID", "POS", "EA", "NEA", "FCON", "IMPINFO", "BETA", "SE", "PVAL", "NEFF"))
+setnames(mdd, "#CHROM", "CHROM")
+mdd <- mdd %>%
+  dplyr::select(chr.outcome = CHROM, pos.outcome = POS, SNP = ID, other_allele.outcome = NEA,
+                effect_allele.outcome = EA, eaf.outcome = FCON, INFO = IMPINFO, samplesize.outcome = NEFF,
+                beta.outcome = BETA, se.outcome = SE, pval.outcome = PVAL) %>%
+  dplyr::filter(INFO > 0.8, eaf.outcome > 0.05, eaf.outcome < 0.95)
+write_clean(mdd, "pgc-mdd2025_no23andMe-noUKBB_eur_v3-49-24-11.tsv.gz")
+```
+
+## Schizophrenia (PGC3, European)
+
+```{r scz}
+# NEFF in this file is half the effective sample size
+scz <- fread(file.path(raw_dir, "PGC3_SCZ_wave3.european.autosome.public.v3.vcf.tsv.gz"),
+             select = c("CHROM", "ID", "POS", "A1", "A2", "FCON", "IMPINFO", "BETA", "SE", "PVAL", "NEFF")) %>%
+  mutate(samplesize.outcome = NEFF * 2) %>%
+  dplyr::select(chr.outcome = CHROM, pos.outcome = POS, SNP = ID, other_allele.outcome = A2,
+                effect_allele.outcome = A1, eaf.outcome = FCON, INFO = IMPINFO, samplesize.outcome,
+                beta.outcome = BETA, se.outcome = SE, pval.outcome = PVAL) %>%
+  dplyr::filter(INFO > 0.8, eaf.outcome > 0.05, eaf.outcome < 0.95)
+write_clean(scz, "PGC3_SCZ_wave3_european_autosome_clean_MAF_GRCh37.tsv.gz")
+```
+
+## Bipolar disorder (PGC 2024, EUR, no UK Biobank or 23andMe)
+
+```{r bip}
+bip <- fread(file.path(raw_dir, "bip2024_eur_noUKB_no23andMe.gz"),
+             select = c("CHR", "SNP", "BP", "A1", "A2", "HRC_FRQ_A1", "INFO", "OR", "SE", "P", "Neff_half")) %>%
+  mutate(samplesize.outcome = Neff_half * 2, beta.outcome = log(OR)) %>%
+  dplyr::select(chr.outcome = CHR, pos.outcome = BP, SNP, other_allele.outcome = A2, effect_allele.outcome = A1,
+                eaf.outcome = HRC_FRQ_A1, INFO, samplesize.outcome, beta.outcome, se.outcome = SE, pval.outcome = P) %>%
+  dplyr::filter(INFO > 0.8, eaf.outcome > 0.05, eaf.outcome < 0.95)
+write_clean(bip, "bip2024_eur_noUKB_no23andMe.tsv.gz")
+```
+
+## Post-traumatic stress disorder (PGC-PTSD freeze 3, EUR)
+
+```{r ptsd}
+# The file has Z and effective N only (sample-size-weighted meta-analysis), so
+# standardised betas and SEs are derived from Z, allele frequency and N.
+ptsd <- fread(file.path(raw_dir, "eur_ptsd_pcs_v4_aug3_2021.vcf.gz"),
+              select = c("#CHROM", "ID", "POS", "A1", "A2", "FREQ", "Z", "P", "NEFF"))
+setnames(ptsd, "#CHROM", "CHROM")
+ptsd <- ptsd %>%
+  mutate(beta.outcome = Z / sqrt(2 * FREQ * (1 - FREQ) * (NEFF + Z^2)),
+         se.outcome   = 1 / sqrt(2 * FREQ * (1 - FREQ) * (NEFF + Z^2))) %>%
+  dplyr::select(chr.outcome = CHROM, pos.outcome = POS, SNP = ID, other_allele.outcome = A2,
+                effect_allele.outcome = A1, eaf.outcome = FREQ, samplesize.outcome = NEFF,
+                beta.outcome, se.outcome, pval.outcome = P) %>%
+  dplyr::filter(eaf.outcome > 0.05, eaf.outcome < 0.95)
+write_clean(ptsd, "eur_ptsd_pcs_v4_aug3_2021.tsv.gz")
+```
+
+## Obsessive-compulsive disorder (PGC 2025, EUR, no 23andMe, UK Biobank left out)
+
+```{r ocd}
+ocd <- fread(file.path(raw_dir, "daner_OCDmeta_wo23andMe_LOOUKBB_080425.gz"),
+             select = c("CHR", "SNP", "BP", "A1", "A2", "FRQ_U_988884", "INFO", "OR", "SE", "P", "Neff_half")) %>%
+  mutate(samplesize.outcome = Neff_half * 2, beta.outcome = log(OR)) %>%
+  dplyr::select(chr.outcome = CHR, pos.outcome = BP, SNP, other_allele.outcome = A2, effect_allele.outcome = A1,
+                eaf.outcome = FRQ_U_988884, INFO, samplesize.outcome, beta.outcome, se.outcome = SE, pval.outcome = P) %>%
+  dplyr::filter(INFO > 0.8, eaf.outcome > 0.05, eaf.outcome < 0.95)
+write_clean(ocd, "daner_OCDmeta_wo23andMe_LOOUKBB_080425.tsv.gz")
+```
+
+## Panic disorder (FinnGen R12, F5_PANIC)
+
+```{r panic}
+# FinnGen reports GRCh38 positions and lists every rsID of a variant in one
+# comma-separated field.
+cases <- 6911; controls <- 444414
+panic <- fread(file.path(raw_dir, "summary_stats_release_finngen_R12_F5_PANIC.gz"),
+               select = c("#chrom", "rsids", "pos", "alt", "ref", "af_alt_controls", "beta", "sebeta", "pval"))
+setnames(panic, "#chrom", "chrom")
+panic <- panic %>%
+  mutate(samplesize.outcome = 4 / (1 / cases + 1 / controls)) %>%
+  dplyr::select(chr.outcome = chrom, pos.outcome = pos, SNP = rsids, other_allele.outcome = ref,
+                effect_allele.outcome = alt, eaf.outcome = af_alt_controls, samplesize.outcome,
+                beta.outcome = beta, se.outcome = sebeta, pval.outcome = pval) %>%
+  dplyr::filter(eaf.outcome > 0.05, eaf.outcome < 0.95)
+
+panic <- as.data.table(panic)[!is.na(SNP) & SNP != ""][!duplicated(SNP)]
+# chr38 and the lifted rows below are matched by position, so panic must not be
+# reordered between here and the chromosome check
+chr38 <- fifelse(panic$chr.outcome == 23, "X", as.character(panic$chr.outcome))
+lo <- liftOver(GRanges(paste0("chr", chr38), IRanges(panic$pos.outcome, width = 1), strand = "+"),
+               import.chain(chain))
+panic[, n_map := lengths(lo)]
+hit <- unlist(lo[panic$n_map == 1])
+m <- panic[n_map == 1]
+m[, `:=`(chr37 = sub("^chr", "", as.character(seqnames(hit))), pos37 = start(hit),
+         strand37 = as.character(strand(hit)))]
+m[, same_chr := chr37 == chr38[panic$n_map == 1]]
+m[, snv := nchar(effect_allele.outcome) == 1 & nchar(other_allele.outcome) == 1]
+m[, keep := same_chr & (strand37 == "+" | snv)]
+comp <- function(x) chartr("ACGT", "TGCA", x)
+m[keep & strand37 == "-", `:=`(effect_allele.outcome = comp(effect_allele.outcome),
+                                other_allele.outcome = comp(other_allele.outcome))]
+panic37 <- m[keep == TRUE, .(chr.outcome = chr37, pos.outcome = pos37, SNP, other_allele.outcome,
+                             effect_allele.outcome, eaf.outcome, samplesize.outcome, beta.outcome,
+                             se.outcome, pval.outcome)]
+panic37 <- panic37[order(fifelse(chr.outcome == "X", 23L, suppressWarnings(as.integer(chr.outcome))), pos.outcome)]
+
+split <- panic37[, .(SNP = unlist(strsplit(SNP, ",", fixed = TRUE))), by = setdiff(names(panic37), "SNP")]
+split[, SNP := trimws(SNP)]
+split <- split[SNP != "" & !is.na(SNP)]
+setcolorder(split, names(panic37))
+split <- split[!duplicated(SNP)]
+write_clean(split, "summary_stats_release_finngen_R12_F5_PANIC_GRCh37_rsID_split.tsv.gz")
+```
+
+## Opioid use disorder (Deak et al. 2022, EUR MTAG)
+
+```{r oud}
+# The MTAG file reports no allele frequencies.
+system2(plink2, c("--bfile", shQuote(ld_panel), "--freq", "--out", shQuote(file.path(tempdir(), "eur"))))
+frq <- fread(file.path(tempdir(), "eur.afreq"), select = c("ID", "REF", "ALT", "ALT_FREQS"))
+setnames(frq, c("snp", "REF", "ALT", "ALT_FREQS"))
+frq <- frq[!duplicated(snp)]
+mtag <- fread(cmd = paste("unzip -p", shQuote(file.path(raw_dir, "Deak_2022_OUD_sumstats.zip")),
+                          "Deak_2022_OUD_sumstats/OUDMTAG_Sumstats_Deak2022_MTAGcolumns.gz | gzip -dc"),
+              select = c("snp", "chr", "bp", "a1", "a2", "mtag_beta", "mtag_se", "mtag_pval"))
+d <- merge(mtag, frq, by = "snp", all.x = TRUE, sort = FALSE)
+d[, eaf_eur := fifelse(is.na(REF), NA_real_,
+                       fifelse(a1 == ALT & a2 == REF, ALT_FREQS, fifelse(a1 == REF & a2 == ALT, 1 - ALT_FREQS, NA_real_)))]
+oud <- d[!is.na(eaf_eur) & eaf_eur > 0.05 & eaf_eur < 0.95,
+         .(chr.outcome = chr, pos.outcome = bp, SNP = snp, other_allele.outcome = a2, effect_allele.outcome = a1,
+           eaf.outcome = eaf_eur, samplesize.outcome = 128748, beta.outcome = mtag_beta,
+           se.outcome = mtag_se, pval.outcome = mtag_pval)]
+write_clean(oud, "OUDMTAG_Sumstats_Deak2022_MTAGcolumns_EURfreq_clean.tsv.gz")
+```
+
+## Treatment resistance in depression (Kang et al. 2024)
+
+```{r trd}
+trd <- fread(file.path(raw_dir, "202205_updated_MVP_MGB_VU_normmgh.meta.0.8n.sumstat"),
+             select = c("CHR", "SNP", "BP", "A1", "A2", "SE", "BETA", "P", "FREQ", "NMISS")) %>%
+  dplyr::select(chr.outcome = CHR, pos.outcome = BP, SNP, other_allele.outcome = A2, effect_allele.outcome = A1,
+                eaf.outcome = FREQ, samplesize.outcome = NMISS, beta.outcome = BETA, se.outcome = SE,
+                pval.outcome = P) %>%
+  dplyr::filter(eaf.outcome > 0.05, eaf.outcome < 0.95)
+write_clean(trd, "202205_updated_MVP_MGB_VU_normmgh.meta.0.8n.sumstat.tsv.gz")
+```
+
+## Treatment resistance in schizophrenia (Pardiñas et al. 2022)
+
+```{r trs}
+# Only MAF is given; A1 is the minor allele (as in PLINK output), so MAF is the
+# A1 frequency. The released SNPs are already restricted to MAF >= 0.05.
+# N counts individuals, so it is scaled to an effective size using the two comparisons behind the
+# interaction: treatment-resistant cases against their controls, and non-resistant against theirs.
+neff <- function(cases, controls) 4 / (1 / cases + 1 / controls)
+eff_share <- (neff(10501, 24542) + neff(20325, 30122)) / (10501 + 24542 + 20325 + 30122)
+trs <- fread(file.path(raw_dir, "trs_interaction.sumstats.txt.gz"),
+             select = c("CHR", "SNP", "BP", "A1", "A2", "MAF", "OR", "SE", "P", "N")) %>%
+  mutate(beta.outcome = log(OR), samplesize.outcome = N * eff_share) %>%
+  dplyr::select(chr.outcome = CHR, pos.outcome = BP, SNP, other_allele.outcome = A2, effect_allele.outcome = A1,
+                eaf.outcome = MAF, samplesize.outcome, beta.outcome, se.outcome = SE, pval.outcome = P)
+write_clean(trs, "trs_interaction_effectiveN.tsv.gz")
+```
+
+## Antidepressant response (Pain et al. 2022, percentage improvement, EUR)
+
+```{r antidepressant}
+# Quantitative trait in daner format: Nco counts individuals, not controls, and holds the declared
+# size of each contributing cohort rather than the number it phenotyped. Direction names the cohorts
+# behind a variant, so each variant's sample size is rescaled to the number they phenotyped.
+cohort_declared   <- c(1152, 586, 783, 474, 71, 132, 177, 309, 490, 1202)  # in Direction order, sums to 5,376
+cohort_phenotyped <- c(1152, 586, 783, 474, 71, 132, 156, 309, 392, 1163)  # Pain et al. Table 1, sums to 5,218
+ad <- fread(file.path(raw_dir, "AntiDepPercImprovEUR2021.gz"),
+            select = c("CHR", "SNP", "BP", "A1", "A2", "FRQ_U_5376", "INFO", "OR", "SE", "P", "Nco", "Direction"))
+dir_pad <- sprintf("%-10s", ad$Direction)          # a few released strings stop short of ten cohorts
+n_declared <- n_phenotyped <- numeric(nrow(ad))
+for (i in seq_along(cohort_declared)) {
+  contributed  <- !substr(dir_pad, i, i) %in% c("?", " ")
+  n_declared   <- n_declared   + contributed * cohort_declared[i]
+  n_phenotyped <- n_phenotyped + contributed * cohort_phenotyped[i]
+}
+stopifnot(mean(n_declared == ad$Nco) > 0.9999, all(n_phenotyped <= n_declared))
+ad <- ad %>%
+  mutate(samplesize.outcome = Nco * n_phenotyped / n_declared, beta.outcome = log(OR)) %>%
+  dplyr::select(chr.outcome = CHR, pos.outcome = BP, SNP, other_allele.outcome = A2, effect_allele.outcome = A1,
+                eaf.outcome = FRQ_U_5376, INFO, samplesize.outcome, beta.outcome, se.outcome = SE, pval.outcome = P) %>%
+  dplyr::filter(INFO > 0.8, eaf.outcome > 0.05, eaf.outcome < 0.95)
+write_clean(ad, "AntiDepPercImprovEUR2021_phenotypeN.tsv.gz")
+```
+
+## Genome-wide significant loci per cleaned file (Table 1)
+
+```{r loci}
+plink19 <- genetics.binaRies::get_plink_binary()
+panel_ids <- fread(paste0(ld_panel, ".bim"), select = 2, header = FALSE)[[1]]
+count_loci <- function(file) {
+  g <- fread(file.path(out_dir, file), select = c("SNP", "chr.outcome", "pos.outcome", "pval.outcome"))
+  g <- g[as.character(chr.outcome) %in% as.character(1:22) & !is.na(pval.outcome)]
+  sig <- g[pval.outcome < 5e-8]
+  if (!nrow(sig)) return(0L)
+  tmp <- tempfile("clump_")
+  fwrite(g[pval.outcome < 1e-4, .(SNP, P = pval.outcome)], paste0(tmp, ".assoc"), sep = "\t")
+  system2(plink19, c("--bfile", shQuote(ld_panel), "--clump", shQuote(paste0(tmp, ".assoc")),
+                     "--clump-p1", "5e-8", "--clump-p2", "1e-4", "--clump-r2", "0.1", "--clump-kb", "1000",
+                     "--out", shQuote(tmp)), stdout = FALSE, stderr = FALSE)
+  cl  <- if (file.exists(paste0(tmp, ".clumped"))) fread(paste0(tmp, ".clumped")) else data.table(SNP = character())
+  idx <- g[SNP %in% cl$SNP, .(chr = as.integer(chr.outcome), pos = pos.outcome)]
+  idx <- rbind(idx, sig[!SNP %in% panel_ids, .(chr = as.integer(chr.outcome), pos = pos.outcome)])[order(chr, pos)]
+  idx[chr == 6 & pos >= 25e6 & pos <= 34e6, pos := 25e6]
+  idx <- unique(idx)
+  uniqueN(cumsum(c(TRUE, diff(idx$pos) > 1e6 | diff(idx$chr) != 0)))
+}
+cleaned <- c(
+  "Major depressive disorder"             = "pgc-mdd2025_no23andMe-noUKBB_eur_v3-49-24-11.tsv.gz",
+  "Schizophrenia"                         = "PGC3_SCZ_wave3_european_autosome_clean_MAF_GRCh37.tsv.gz",
+  "Bipolar disorder"                      = "bip2024_eur_noUKB_no23andMe.tsv.gz",
+  "Post-traumatic stress disorder"        = "eur_ptsd_pcs_v4_aug3_2021.tsv.gz",
+  "Obsessive compulsive disorder"         = "daner_OCDmeta_wo23andMe_LOOUKBB_080425.tsv.gz",
+  "Panic disorder"                        = "summary_stats_release_finngen_R12_F5_PANIC_GRCh37_rsID_split.tsv.gz",
+  "Opioid use disorder"                   = "OUDMTAG_Sumstats_Deak2022_MTAGcolumns_EURfreq_clean.tsv.gz",
+  "Treatment resistance in depression"    = "202205_updated_MVP_MGB_VU_normmgh.meta.0.8n.sumstat.tsv.gz",
+  "Treatment resistance in schizophrenia" = "trs_interaction_effectiveN.tsv.gz",
+  "Antidepressant response"               = "AntiDepPercImprovEUR2021_phenotypeN.tsv.gz")
+loci <- data.table(outcome = names(cleaned), file = cleaned, loci = vapply(cleaned, count_loci, integer(1)))
+fwrite(loci, file.path(out_dir, "outcome_loci_counts.csv"))
+loci
+```
